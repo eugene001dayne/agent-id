@@ -55,3 +55,37 @@ class AgentID:
         r = self.client.get("/dashboard/stats")
         r.raise_for_status()
         return r.json()
+
+    def update_reputation(self, agent_id: str, interaction_success: bool,
+                          violation: bool = False, pii_incident: bool = False,
+                          detail: Optional[str] = None):
+        r = self.client.post(f"/agents/{agent_id}/reputation/update", json={
+            "interaction_success": interaction_success,
+            "violation": violation,
+            "pii_incident": pii_incident,
+            "detail": detail
+        })
+        r.raise_for_status()
+        return r.json()
+
+    def get_reputation_history(self, agent_id: str):
+        r = self.client.get(f"/agents/{agent_id}/reputation/history")
+        r.raise_for_status()
+        return r.json()    
+
+    def trust_lookup(self, agent_id: str, public_key: str,
+                     querying_agent: Optional[str] = None,
+                     min_reputation: float = 0.7):
+        r = self.client.post("/trust/lookup", json={
+            "agent_id": agent_id,
+            "public_key": public_key,
+            "querying_agent": querying_agent,
+            "min_reputation": min_reputation
+        })
+        r.raise_for_status()
+        return r.json()
+
+    def list_trust_lookups(self, limit: int = 50):
+        r = self.client.get("/trust/lookups", params={"limit": limit})
+        r.raise_for_status()
+        return r.json()    

@@ -56,6 +56,32 @@ class AgentID {
   stats() {
     return this._request("GET", "/dashboard/stats");
   }
+
+updateReputation(agentId, interactionSuccess, violation = false, piiIncident = false, detail = null) {
+    return this._request("POST", `/agents/${agentId}/reputation/update`, {
+      interaction_success: interactionSuccess,
+      violation,
+      pii_incident: piiIncident,
+      detail
+    });
+  }
+
+  getReputationHistory(agentId) {
+    return this._request("GET", `/agents/${agentId}/reputation/history`);
+  }  
+
+  trustLookup(agentId, publicKey, queryingAgent = null, minReputation = 0.7) {
+    return this._request("POST", "/trust/lookup", {
+      agent_id: agentId,
+      public_key: publicKey,
+      querying_agent: queryingAgent,
+      min_reputation: minReputation
+    });
+  }
+
+  listTrustLookups(limit = 50) {
+    return this._request("GET", `/trust/lookups?limit=${limit}`);
+  }
 }
 
 module.exports = AgentID;

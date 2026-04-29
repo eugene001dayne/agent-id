@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="threadagentid",
-    version="0.1.0",
+    version="0.3.0",
     description="Cryptographic identity and reputation for AI agents. Part of the Thread Suite.",
     long_description=open("../README.md").read() if __import__("os").path.exists("../README.md") else "",
     long_description_content_type="text/markdown",

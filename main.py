@@ -26,7 +26,7 @@ HEADERS = {
 app = FastAPI(
     title="AgentID",
     description="Cryptographic identity and reputation for AI agents.",
-    version="0.2.0"
+    version="0.3.0"
 )
 
 app.add_middleware(
@@ -57,6 +57,12 @@ class ReputationUpdate(BaseModel):
     violation: bool = False
     pii_incident: bool = False
     detail: Optional[str] = None
+
+class TrustLookupRequest(BaseModel):
+    agent_id: str
+    public_key: str
+    querying_agent: Optional[str] = None
+    min_reputation: float = 0.7
 
 
 # --- Helpers ---
@@ -106,7 +112,7 @@ def log_history(client: httpx.Client, agent_id: str, event_type: str, detail: st
 def root():
     return {
         "tool": "AgentID",
-        "version": "0.2.0",
+        "version": "0.3.0",
         "status": "running",
         "description": "Cryptographic identity and reputation for AI agents.",
         "suite": "Thread Suite"
@@ -328,7 +334,6 @@ def update_reputation(agent_id: str, body: ReputationUpdate):
             new_total, new_successful, new_violations, new_pii
         )
 
-        # Update reputation record
         client.patch(
             f"/reputation?agent_id=eq.{agent_id}",
             json={
@@ -341,7 +346,6 @@ def update_reputation(agent_id: str, body: ReputationUpdate):
             }
         )
 
-        # Log to reputation history
         client.post("/reputation_history", json={
             "agent_id": agent_id,
             "score_before": score_before,
@@ -416,6 +420,158 @@ def get_history(agent_id: str):
             "history": hist_r.json(),
             "count": len(hist_r.json())
         }
+
+
+@app.post("/trust/lookup")
+def trust_lookup(body: TrustLookupRequest):
+    """
+    One-call trust decision for any agent.
+    Verifies credential, checks reputation, returns trusted: true/false.
+    Used by ChainThread, PolicyThread, and any system that needs to
+    verify an agent before accepting a handoff or interaction.
+    """
+    with db() as client:
+        r = client.get("/agents", params={"agent_id": f"eq.{body.agent_id}"})
+        if not r.json():
+            result = {
+                "agent_id": body.agent_id,
+                "trusted": False,
+                "reason": "Agent not found in registry.",
+                "credential_valid": False,
+                "reputation_score": None,
+                "grade": None,
+                "querying_agent": body.querying_agent,
+                "min_reputation": body.min_reputation
+            }
+            client.post("/trust_lookups", json={
+                "querying_agent": body.querying_agent,
+                "queried_agent": body.agent_id,
+                "result": result
+            })
+            return result
+
+        agent = r.json()[0]
+
+        # Check active
+        if not agent["active"]:
+            result = {
+                "agent_id": body.agent_id,
+                "agent_name": agent["agent_name"],
+                "trusted": False,
+                "reason": "Agent credential is inactive or revoked.",
+                "credential_valid": False,
+                "reputation_score": None,
+                "grade": None,
+                "querying_agent": body.querying_agent,
+                "min_reputation": body.min_reputation
+            }
+            client.post("/trust_lookups", json={
+                "querying_agent": body.querying_agent,
+                "queried_agent": body.agent_id,
+                "result": result
+            })
+            return result
+
+        # Verify public key
+        if agent["public_key"] != body.public_key:
+            result = {
+                "agent_id": body.agent_id,
+                "agent_name": agent["agent_name"],
+                "trusted": False,
+                "reason": "Public key does not match registered credential.",
+                "credential_valid": False,
+                "reputation_score": None,
+                "grade": None,
+                "querying_agent": body.querying_agent,
+                "min_reputation": body.min_reputation
+            }
+            client.post("/trust_lookups", json={
+                "querying_agent": body.querying_agent,
+                "queried_agent": body.agent_id,
+                "result": result
+            })
+            return result
+
+        # Verify credential hash
+        recomputed = generate_credential_hash(
+            body.agent_id,
+            agent["public_key"],
+            agent["issuer"]
+        )
+        credential_valid = recomputed == agent["credential_hash"]
+
+        if not credential_valid:
+            result = {
+                "agent_id": body.agent_id,
+                "agent_name": agent["agent_name"],
+                "trusted": False,
+                "reason": "Credential hash integrity check failed.",
+                "credential_valid": False,
+                "reputation_score": None,
+                "grade": None,
+                "querying_agent": body.querying_agent,
+                "min_reputation": body.min_reputation
+            }
+            client.post("/trust_lookups", json={
+                "querying_agent": body.querying_agent,
+                "queried_agent": body.agent_id,
+                "result": result
+            })
+            return result
+
+        # Check reputation
+        rep_r = client.get("/reputation", params={"agent_id": f"eq.{body.agent_id}"})
+        rep = rep_r.json()[0] if rep_r.json() else None
+        score = rep["reputation_score"] if rep else 1.0
+        grade = get_reputation_grade(score)
+
+        meets_threshold = score >= body.min_reputation
+        trusted = credential_valid and meets_threshold
+
+        reason = "Agent is trusted. Credential valid and reputation meets threshold."
+        if not meets_threshold:
+            reason = (f"Reputation score {score} is below the required "
+                     f"minimum of {body.min_reputation}.")
+
+        result = {
+            "agent_id": body.agent_id,
+            "agent_name": agent["agent_name"],
+            "trusted": trusted,
+            "reason": reason,
+            "credential_valid": credential_valid,
+            "reputation_score": score,
+            "grade": grade,
+            "total_interactions": rep["total_interactions"] if rep else 0,
+            "violation_count": rep["violation_count"] if rep else 0,
+            "querying_agent": body.querying_agent,
+            "min_reputation": body.min_reputation,
+            "issuer": agent["issuer"],
+            "looked_up_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        client.post("/trust_lookups", json={
+            "querying_agent": body.querying_agent,
+            "queried_agent": body.agent_id,
+            "result": result
+        })
+
+        log_history(client, body.agent_id, "TRUST_LOOKUP",
+                    f"Queried by '{body.querying_agent}'. "
+                    f"Trusted: {trusted}. Score: {score}.")
+
+    return result
+
+
+@app.get("/trust/lookups")
+def list_trust_lookups(limit: int = 50):
+    """List all trust lookup records."""
+    with db() as client:
+        r = client.get("/trust_lookups", params={
+            "order": "created_at.desc",
+            "limit": str(limit)
+        })
+        lookups = r.json()
+        return {"lookups": lookups, "count": len(lookups)}
 
 
 @app.get("/dashboard/stats")
