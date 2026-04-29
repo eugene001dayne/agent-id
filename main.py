@@ -26,7 +26,7 @@ HEADERS = {
 app = FastAPI(
     title="AgentID",
     description="Cryptographic identity and reputation for AI agents.",
-    version="0.1.0"
+    version="0.2.0"
 )
 
 app.add_middleware(
@@ -52,6 +52,12 @@ class VerifyRequest(BaseModel):
     public_key: str
     credential_hash: Optional[str] = None
 
+class ReputationUpdate(BaseModel):
+    interaction_success: bool
+    violation: bool = False
+    pii_incident: bool = False
+    detail: Optional[str] = None
+
 
 # --- Helpers ---
 
@@ -70,6 +76,19 @@ def get_reputation_grade(score: float) -> str:
     if score >= 0.4: return "D"
     return "F"
 
+def compute_reputation_score(
+    total: int,
+    successful: int,
+    violations: int,
+    pii_incidents: int
+) -> float:
+    if total == 0:
+        return 1.0
+    base = successful / total
+    violation_penalty = violations * 0.02
+    pii_penalty = pii_incidents * 0.05
+    return round(max(0.0, min(1.0, base - violation_penalty - pii_penalty)), 4)
+
 def log_history(client: httpx.Client, agent_id: str, event_type: str, detail: str):
     try:
         client.post("/credential_history", json={
@@ -87,7 +106,7 @@ def log_history(client: httpx.Client, agent_id: str, event_type: str, detail: st
 def root():
     return {
         "tool": "AgentID",
-        "version": "0.1.0",
+        "version": "0.2.0",
         "status": "running",
         "description": "Cryptographic identity and reputation for AI agents.",
         "suite": "Thread Suite"
@@ -278,6 +297,105 @@ def get_reputation(agent_id: str):
             "violation_count": rep["violation_count"],
             "pii_incidents": rep["pii_incidents"],
             "last_updated": rep["last_updated"]
+        }
+
+
+@app.post("/agents/{agent_id}/reputation/update")
+def update_reputation(agent_id: str, body: ReputationUpdate):
+    """Submit an interaction outcome and update the agent's reputation score."""
+    with db() as client:
+        r = client.get("/agents", params={
+            "agent_id": f"eq.{agent_id}",
+            "select": "agent_id,agent_name,active"
+        })
+        if not r.json():
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+        if not r.json()[0]["active"]:
+            raise HTTPException(status_code=400, detail="Cannot update reputation for inactive agent.")
+
+        rep_r = client.get("/reputation", params={"agent_id": f"eq.{agent_id}"})
+        if not rep_r.json():
+            raise HTTPException(status_code=404, detail="Reputation record not found.")
+        rep = rep_r.json()[0]
+
+        score_before = rep["reputation_score"]
+        new_total = rep["total_interactions"] + 1
+        new_successful = rep["successful_interactions"] + (1 if body.interaction_success else 0)
+        new_violations = rep["violation_count"] + (1 if body.violation else 0)
+        new_pii = rep["pii_incidents"] + (1 if body.pii_incident else 0)
+
+        score_after = compute_reputation_score(
+            new_total, new_successful, new_violations, new_pii
+        )
+
+        # Update reputation record
+        client.patch(
+            f"/reputation?agent_id=eq.{agent_id}",
+            json={
+                "total_interactions": new_total,
+                "successful_interactions": new_successful,
+                "violation_count": new_violations,
+                "pii_incidents": new_pii,
+                "reputation_score": score_after,
+                "last_updated": datetime.now(timezone.utc).isoformat()
+            }
+        )
+
+        # Log to reputation history
+        client.post("/reputation_history", json={
+            "agent_id": agent_id,
+            "score_before": score_before,
+            "score_after": score_after,
+            "interaction_success": body.interaction_success,
+            "violation": body.violation,
+            "pii_incident": body.pii_incident,
+            "detail": body.detail
+        })
+
+        log_history(client, agent_id, "REPUTATION_UPDATED",
+                    f"Score {score_before} → {score_after}. "
+                    f"Success: {body.interaction_success}, "
+                    f"Violation: {body.violation}, PII: {body.pii_incident}")
+
+    return {
+        "agent_id": agent_id,
+        "score_before": score_before,
+        "score_after": score_after,
+        "grade_before": get_reputation_grade(score_before),
+        "grade_after": get_reputation_grade(score_after),
+        "total_interactions": new_total,
+        "successful_interactions": new_successful,
+        "violation_count": new_violations,
+        "pii_incidents": new_pii,
+        "interaction_success": body.interaction_success,
+        "violation": body.violation,
+        "pii_incident": body.pii_incident
+    }
+
+
+@app.get("/agents/{agent_id}/reputation/history")
+def get_reputation_history(agent_id: str):
+    """Get the full reputation score history for an agent."""
+    with db() as client:
+        r = client.get("/agents", params={"agent_id": f"eq.{agent_id}", "select": "agent_id"})
+        if not r.json():
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+
+        hist_r = client.get("/reputation_history", params={
+            "agent_id": f"eq.{agent_id}",
+            "order": "created_at.desc"
+        })
+        history = hist_r.json()
+
+        rep_r = client.get("/reputation", params={"agent_id": f"eq.{agent_id}"})
+        rep = rep_r.json()[0] if rep_r.json() else None
+
+        return {
+            "agent_id": agent_id,
+            "current_score": rep["reputation_score"] if rep else None,
+            "current_grade": get_reputation_grade(rep["reputation_score"]) if rep else None,
+            "total_events": len(history),
+            "history": history
         }
 
 
