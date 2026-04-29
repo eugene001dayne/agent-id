@@ -1,0 +1,15 @@
+{
+  "name": "agentid",
+  "version": "0.1.0",
+  "description": "Cryptographic identity and reputation for AI agents. Part of the Thread Suite.",
+  "main": "index.js",
+  "dependencies": {
+    "node-fetch": "^2.6.9"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/eugene001dayne/agent-id"
+  },
+  "author": "Eugene Dayne Mawuli",
+  "license": "Apache-2.0"
+}
