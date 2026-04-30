@@ -23,10 +23,20 @@ HEADERS = {
     "Prefer": "return=representation"
 }
 
+THREAD_SUITE_URLS = {
+    "iron-thread": "https://iron-thread.onrender.com",
+    "testthread": "https://test-thread-cass.onrender.com",
+    "promptthread": "https://prompt-thread.onrender.com",
+    "chainthread": "https://chain-thread.onrender.com",
+    "policythread": "https://policy-thread.onrender.com",
+    "threadwatch": "https://thread-watch.onrender.com",
+    "behavioral-fingerprint": "https://behavioral-fingerprint.onrender.com"
+}
+
 app = FastAPI(
     title="AgentID",
     description="Cryptographic identity and reputation for AI agents.",
-    version="0.3.0"
+    version="0.4.0"
 )
 
 app.add_middleware(
@@ -62,6 +72,13 @@ class TrustLookupRequest(BaseModel):
     agent_id: str
     public_key: str
     querying_agent: Optional[str] = None
+    min_reputation: float = 0.7
+
+class ChainThreadBridgeRequest(BaseModel):
+    chain_id: str
+    sender_id: str
+    sender_public_key: str
+    receiver_id: Optional[str] = None
     min_reputation: float = 0.7
 
 
@@ -112,7 +129,7 @@ def log_history(client: httpx.Client, agent_id: str, event_type: str, detail: st
 def root():
     return {
         "tool": "AgentID",
-        "version": "0.3.0",
+        "version": "0.4.0",
         "status": "running",
         "description": "Cryptographic identity and reputation for AI agents.",
         "suite": "Thread Suite"
@@ -317,7 +334,8 @@ def update_reputation(agent_id: str, body: ReputationUpdate):
         if not r.json():
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
         if not r.json()[0]["active"]:
-            raise HTTPException(status_code=400, detail="Cannot update reputation for inactive agent.")
+            raise HTTPException(status_code=400,
+                                detail="Cannot update reputation for inactive agent.")
 
         rep_r = client.get("/reputation", params={"agent_id": f"eq.{agent_id}"})
         if not rep_r.json():
@@ -381,7 +399,8 @@ def update_reputation(agent_id: str, body: ReputationUpdate):
 def get_reputation_history(agent_id: str):
     """Get the full reputation score history for an agent."""
     with db() as client:
-        r = client.get("/agents", params={"agent_id": f"eq.{agent_id}", "select": "agent_id"})
+        r = client.get("/agents", params={"agent_id": f"eq.{agent_id}",
+                                          "select": "agent_id"})
         if not r.json():
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
 
@@ -407,7 +426,8 @@ def get_reputation_history(agent_id: str):
 def get_history(agent_id: str):
     """Get the full credential event history for an agent."""
     with db() as client:
-        r = client.get("/agents", params={"agent_id": f"eq.{agent_id}", "select": "agent_id"})
+        r = client.get("/agents", params={"agent_id": f"eq.{agent_id}",
+                                          "select": "agent_id"})
         if not r.json():
             raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
 
@@ -427,8 +447,6 @@ def trust_lookup(body: TrustLookupRequest):
     """
     One-call trust decision for any agent.
     Verifies credential, checks reputation, returns trusted: true/false.
-    Used by ChainThread, PolicyThread, and any system that needs to
-    verify an agent before accepting a handoff or interaction.
     """
     with db() as client:
         r = client.get("/agents", params={"agent_id": f"eq.{body.agent_id}"})
@@ -452,7 +470,6 @@ def trust_lookup(body: TrustLookupRequest):
 
         agent = r.json()[0]
 
-        # Check active
         if not agent["active"]:
             result = {
                 "agent_id": body.agent_id,
@@ -472,7 +489,6 @@ def trust_lookup(body: TrustLookupRequest):
             })
             return result
 
-        # Verify public key
         if agent["public_key"] != body.public_key:
             result = {
                 "agent_id": body.agent_id,
@@ -492,7 +508,6 @@ def trust_lookup(body: TrustLookupRequest):
             })
             return result
 
-        # Verify credential hash
         recomputed = generate_credential_hash(
             body.agent_id,
             agent["public_key"],
@@ -519,19 +534,17 @@ def trust_lookup(body: TrustLookupRequest):
             })
             return result
 
-        # Check reputation
         rep_r = client.get("/reputation", params={"agent_id": f"eq.{body.agent_id}"})
         rep = rep_r.json()[0] if rep_r.json() else None
         score = rep["reputation_score"] if rep else 1.0
         grade = get_reputation_grade(score)
-
         meets_threshold = score >= body.min_reputation
         trusted = credential_valid and meets_threshold
 
         reason = "Agent is trusted. Credential valid and reputation meets threshold."
         if not meets_threshold:
             reason = (f"Reputation score {score} is below the required "
-                     f"minimum of {body.min_reputation}.")
+                      f"minimum of {body.min_reputation}.")
 
         result = {
             "agent_id": body.agent_id,
@@ -572,6 +585,137 @@ def list_trust_lookups(limit: int = 50):
         })
         lookups = r.json()
         return {"lookups": lookups, "count": len(lookups)}
+
+
+@app.post("/bridge/chainthread")
+def bridge_chainthread(body: ChainThreadBridgeRequest):
+    """
+    ChainThread bridge — verify a sender agent's identity and reputation
+    before a handoff envelope is accepted.
+    ChainThread calls this endpoint when processing an envelope.
+    """
+    with db() as client:
+        r = client.get("/agents", params={"agent_id": f"eq.{body.sender_id}"})
+
+        if not r.json():
+            result = {
+                "chain_id": body.chain_id,
+                "sender_id": body.sender_id,
+                "receiver_id": body.receiver_id,
+                "identity_verified": False,
+                "trusted": False,
+                "reason": "Sender agent not found in AgentID registry.",
+                "reputation_score": None,
+                "grade": None,
+                "recommendation": "BLOCK — sender has no registered identity."
+            }
+            log_history(client, body.sender_id, "CHAINTHREAD_BRIDGE",
+                        f"Chain {body.chain_id}: sender not found in registry.")
+            return result
+
+        agent = r.json()[0]
+
+        if not agent["active"]:
+            result = {
+                "chain_id": body.chain_id,
+                "sender_id": body.sender_id,
+                "receiver_id": body.receiver_id,
+                "identity_verified": False,
+                "trusted": False,
+                "reason": "Sender agent credential is inactive or revoked.",
+                "reputation_score": None,
+                "grade": None,
+                "recommendation": "BLOCK — sender credential revoked."
+            }
+            log_history(client, body.sender_id, "CHAINTHREAD_BRIDGE",
+                        f"Chain {body.chain_id}: sender credential inactive.")
+            return result
+
+        if agent["public_key"] != body.sender_public_key:
+            result = {
+                "chain_id": body.chain_id,
+                "sender_id": body.sender_id,
+                "receiver_id": body.receiver_id,
+                "identity_verified": False,
+                "trusted": False,
+                "reason": "Sender public key does not match registered credential.",
+                "reputation_score": None,
+                "grade": None,
+                "recommendation": "BLOCK — identity mismatch."
+            }
+            log_history(client, body.sender_id, "CHAINTHREAD_BRIDGE",
+                        f"Chain {body.chain_id}: public key mismatch.")
+            return result
+
+        recomputed = generate_credential_hash(
+            body.sender_id,
+            agent["public_key"],
+            agent["issuer"]
+        )
+        identity_verified = recomputed == agent["credential_hash"]
+
+        rep_r = client.get("/reputation", params={"agent_id": f"eq.{body.sender_id}"})
+        rep = rep_r.json()[0] if rep_r.json() else None
+        score = rep["reputation_score"] if rep else 1.0
+        grade = get_reputation_grade(score)
+        meets_threshold = score >= body.min_reputation
+        trusted = identity_verified and meets_threshold
+
+        if not identity_verified:
+            recommendation = "BLOCK — credential integrity check failed."
+        elif not meets_threshold:
+            recommendation = (f"BLOCK — reputation {score} below required {body.min_reputation}.")
+        else:
+            recommendation = "ALLOW — identity verified and reputation meets threshold."
+
+        result = {
+            "chain_id": body.chain_id,
+            "sender_id": body.sender_id,
+            "sender_name": agent["agent_name"],
+            "receiver_id": body.receiver_id,
+            "identity_verified": identity_verified,
+            "trusted": trusted,
+            "reason": recommendation,
+            "credential_valid": identity_verified,
+            "reputation_score": score,
+            "grade": grade,
+            "total_interactions": rep["total_interactions"] if rep else 0,
+            "violation_count": rep["violation_count"] if rep else 0,
+            "min_reputation": body.min_reputation,
+            "recommendation": recommendation,
+            "checked_at": datetime.now(timezone.utc).isoformat()
+        }
+
+        client.post("/trust_lookups", json={
+            "querying_agent": body.receiver_id,
+            "queried_agent": body.sender_id,
+            "result": result
+        })
+
+        log_history(client, body.sender_id, "CHAINTHREAD_BRIDGE",
+                    f"Chain {body.chain_id}: trusted={trusted}, score={score}.")
+
+    return result
+
+
+@app.get("/bridge/status")
+def bridge_status():
+    """Poll all Thread Suite tools and return online/offline status."""
+    results = {}
+    for tool, url in THREAD_SUITE_URLS.items():
+        try:
+            r = httpx.get(f"{url}/health", timeout=5.0)
+            results[tool] = {
+                "status": "online" if r.status_code == 200 else "degraded",
+                "url": url
+            }
+        except Exception:
+            results[tool] = {"status": "offline", "url": url}
+    return {
+        "agentid": {"status": "online", "url": "https://agent-id.onrender.com"},
+        **results,
+        "checked_at": datetime.now(timezone.utc).isoformat()
+    }
 
 
 @app.get("/dashboard/stats")
