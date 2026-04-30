@@ -1,6 +1,6 @@
 {
   "name": "threadagentid",
-  "version": "0.3.0",
+  "version": "0.5.0",
   "description": "Cryptographic identity and reputation for AI agents. Part of the Thread Suite.",
   "main": "index.js",
   "dependencies": {

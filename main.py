@@ -36,7 +36,7 @@ THREAD_SUITE_URLS = {
 app = FastAPI(
     title="AgentID",
     description="Cryptographic identity and reputation for AI agents.",
-    version="0.4.0"
+    version="0.5.0"
 )
 
 app.add_middleware(
@@ -80,6 +80,13 @@ class ChainThreadBridgeRequest(BaseModel):
     sender_public_key: str
     receiver_id: Optional[str] = None
     min_reputation: float = 0.7
+
+class RevokeRequest(BaseModel):
+    reason: Optional[str] = None
+
+class ReactivateRequest(BaseModel):
+    public_key: str
+    reason: Optional[str] = None
 
 
 # --- Helpers ---
@@ -129,7 +136,7 @@ def log_history(client: httpx.Client, agent_id: str, event_type: str, detail: st
 def root():
     return {
         "tool": "AgentID",
-        "version": "0.4.0",
+        "version": "0.5.0",
         "status": "running",
         "description": "Cryptographic identity and reputation for AI agents.",
         "suite": "Thread Suite"
@@ -291,6 +298,84 @@ def verify_credential(agent_id: str, body: VerifyRequest):
     }
 
 
+@app.post("/agents/{agent_id}/revoke")
+def revoke_credential(agent_id: str, body: RevokeRequest):
+    """Revoke an agent's credential. All future trust lookups will return trusted: false."""
+    with db() as client:
+        r = client.get("/agents", params={"agent_id": f"eq.{agent_id}"})
+        if not r.json():
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+        agent = r.json()[0]
+
+        if not agent["active"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Credential is already inactive."
+            )
+
+        client.patch(
+            f"/agents?agent_id=eq.{agent_id}",
+            json={"active": False}
+        )
+
+        reason = body.reason or "No reason provided."
+        log_history(client, agent_id, "REVOKED",
+                    f"Credential revoked. Reason: {reason}")
+
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent["agent_name"],
+        "revoked": True,
+        "active": False,
+        "reason": reason,
+        "revoked_at": datetime.now(timezone.utc).isoformat(),
+        "message": "Credential revoked. All future trust lookups will return trusted: false."
+    }
+
+
+@app.post("/agents/{agent_id}/reactivate")
+def reactivate_credential(agent_id: str, body: ReactivateRequest):
+    """Reactivate a previously revoked credential. Requires the original public key."""
+    with db() as client:
+        r = client.get("/agents", params={"agent_id": f"eq.{agent_id}"})
+        if not r.json():
+            raise HTTPException(status_code=404, detail=f"Agent '{agent_id}' not found.")
+        agent = r.json()[0]
+
+        if agent["active"]:
+            raise HTTPException(
+                status_code=400,
+                detail="Credential is already active."
+            )
+
+        if agent["public_key"] != body.public_key:
+            log_history(client, agent_id, "REACTIVATION_FAILED",
+                        "Reactivation attempted with wrong public key.")
+            raise HTTPException(
+                status_code=403,
+                detail="Public key does not match. Reactivation denied."
+            )
+
+        client.patch(
+            f"/agents?agent_id=eq.{agent_id}",
+            json={"active": True}
+        )
+
+        reason = body.reason or "No reason provided."
+        log_history(client, agent_id, "REACTIVATED",
+                    f"Credential reactivated. Reason: {reason}")
+
+    return {
+        "agent_id": agent_id,
+        "agent_name": agent["agent_name"],
+        "reactivated": True,
+        "active": True,
+        "reason": reason,
+        "reactivated_at": datetime.now(timezone.utc).isoformat(),
+        "message": "Credential reactivated. Trust lookups will now proceed normally."
+    }
+
+
 @app.get("/agents/{agent_id}/reputation")
 def get_reputation(agent_id: str):
     """Get an agent's full reputation record."""
@@ -444,10 +529,7 @@ def get_history(agent_id: str):
 
 @app.post("/trust/lookup")
 def trust_lookup(body: TrustLookupRequest):
-    """
-    One-call trust decision for any agent.
-    Verifies credential, checks reputation, returns trusted: true/false.
-    """
+    """One-call trust decision for any agent."""
     with db() as client:
         r = client.get("/agents", params={"agent_id": f"eq.{body.agent_id}"})
         if not r.json():
@@ -589,11 +671,7 @@ def list_trust_lookups(limit: int = 50):
 
 @app.post("/bridge/chainthread")
 def bridge_chainthread(body: ChainThreadBridgeRequest):
-    """
-    ChainThread bridge — verify a sender agent's identity and reputation
-    before a handoff envelope is accepted.
-    ChainThread calls this endpoint when processing an envelope.
-    """
+    """ChainThread bridge — verify sender identity and reputation before handoff."""
     with db() as client:
         r = client.get("/agents", params={"agent_id": f"eq.{body.sender_id}"})
 
@@ -610,7 +688,7 @@ def bridge_chainthread(body: ChainThreadBridgeRequest):
                 "recommendation": "BLOCK — sender has no registered identity."
             }
             log_history(client, body.sender_id, "CHAINTHREAD_BRIDGE",
-                        f"Chain {body.chain_id}: sender not found in registry.")
+                        f"Chain {body.chain_id}: sender not found.")
             return result
 
         agent = r.json()[0]
@@ -664,7 +742,8 @@ def bridge_chainthread(body: ChainThreadBridgeRequest):
         if not identity_verified:
             recommendation = "BLOCK — credential integrity check failed."
         elif not meets_threshold:
-            recommendation = (f"BLOCK — reputation {score} below required {body.min_reputation}.")
+            recommendation = (f"BLOCK — reputation {score} below required "
+                              f"{body.min_reputation}.")
         else:
             recommendation = "ALLOW — identity verified and reputation meets threshold."
 

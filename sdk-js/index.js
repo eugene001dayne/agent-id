@@ -82,6 +82,31 @@ updateReputation(agentId, interactionSuccess, violation = false, piiIncident = f
   listTrustLookups(limit = 50) {
     return this._request("GET", `/trust/lookups?limit=${limit}`);
   }
+
+  bridgeChainthread(chainId, senderId, senderPublicKey, receiverId = null, minReputation = 0.7) {
+    return this._request("POST", "/bridge/chainthread", {
+      chain_id: chainId,
+      sender_id: senderId,
+      sender_public_key: senderPublicKey,
+      receiver_id: receiverId,
+      min_reputation: minReputation
+    });
+  }
+
+  bridgeStatus() {
+    return this._request("GET", "/bridge/status");
+  }
+
+  revoke(agentId, reason = null) {
+    return this._request("POST", `/agents/${agentId}/revoke`, { reason });
+  }
+
+  reactivate(agentId, publicKey, reason = null) {
+    return this._request("POST", `/agents/${agentId}/reactivate`, {
+      public_key: publicKey,
+      reason
+    });
+  }
 }
 
 module.exports = AgentID;

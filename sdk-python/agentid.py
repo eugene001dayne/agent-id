@@ -89,3 +89,34 @@ class AgentID:
         r = self.client.get("/trust/lookups", params={"limit": limit})
         r.raise_for_status()
         return r.json()    
+    
+    def bridge_chainthread(self, chain_id: str, sender_id: str,
+                           sender_public_key: str, receiver_id: Optional[str] = None,
+                           min_reputation: float = 0.7):
+        r = self.client.post("/bridge/chainthread", json={
+            "chain_id": chain_id,
+            "sender_id": sender_id,
+            "sender_public_key": sender_public_key,
+            "receiver_id": receiver_id,
+            "min_reputation": min_reputation
+        })
+        r.raise_for_status()
+        return r.json()
+
+    def bridge_status(self):
+        r = self.client.get("/bridge/status")
+        r.raise_for_status()
+        return r.json() 
+
+    def revoke(self, agent_id: str, reason: Optional[str] = None):
+        r = self.client.post(f"/agents/{agent_id}/revoke", json={"reason": reason})
+        r.raise_for_status()
+        return r.json()
+
+    def reactivate(self, agent_id: str, public_key: str, reason: Optional[str] = None):
+        r = self.client.post(f"/agents/{agent_id}/reactivate", json={
+            "public_key": public_key,
+            "reason": reason
+        })
+        r.raise_for_status()
+        return r.json()   
