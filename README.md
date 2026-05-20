@@ -4,6 +4,8 @@ Cryptographic identity and reputation for AI agents. Part of the [Thread Suite](
 
 Every AI agent gets a verifiable identity and a track record. When two agents meet, they present credentials. Trust is earned, not assumed.
 
+(Learn more at threadsuite.netlify.app)
+
 ## The Problem
 
 In multi-agent systems, agents interact with other agents constantly. Right now there is no standard for agent identity. An `agent_id` is just a string. There is no way to verify who an agent is, what its history is, or whether it has a track record of reliable behavior. AgentID fixes this.
