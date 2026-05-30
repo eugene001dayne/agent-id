@@ -33,10 +33,15 @@ THREAD_SUITE_URLS = {
     "behavioral-fingerprint": "https://behavioral-fingerprint.onrender.com"
 }
 
+# Trust ceiling constants
+TRUST_CEILING_BEFORE_TRACK_RECORD = 0.8
+VERIFIED_INTERACTIONS_REQUIRED = 10
+DEFAULT_STARTING_SCORE = 0.5
+
 app = FastAPI(
     title="AgentID",
     description="Cryptographic identity and reputation for AI agents.",
-    version="0.5.0"
+    version="0.6.0"
 )
 
 app.add_middleware(
@@ -99,25 +104,42 @@ def generate_credential_hash(agent_id: str, public_key: str, issuer: str) -> str
     }, sort_keys=True)
     return hashlib.sha256(data.encode()).hexdigest()
 
-def get_reputation_grade(score: float) -> str:
-    if score >= 0.9: return "A"
-    if score >= 0.75: return "B"
+def get_reputation_grade(score: float, verified_interactions: int) -> str:
+    """
+    Grade requires both a high score AND a track record.
+    A new agent cannot receive grade A regardless of score
+    until it has at least 10 verified interactions.
+    """
+    has_track_record = verified_interactions >= VERIFIED_INTERACTIONS_REQUIRED
+    if score >= 0.9 and has_track_record: return "A"
+    if score >= 0.75 and has_track_record: return "B"
     if score >= 0.6: return "C"
     if score >= 0.4: return "D"
     return "F"
+
+def apply_trust_ceiling(score: float, verified_interactions: int) -> float:
+    """
+    Agents with fewer than 10 verified interactions cannot exceed 0.8.
+    This prevents brand-new agents from immediately being fully trusted.
+    """
+    if verified_interactions < VERIFIED_INTERACTIONS_REQUIRED:
+        return min(score, TRUST_CEILING_BEFORE_TRACK_RECORD)
+    return score
 
 def compute_reputation_score(
     total: int,
     successful: int,
     violations: int,
-    pii_incidents: int
+    pii_incidents: int,
+    verified_interactions: int
 ) -> float:
     if total == 0:
-        return 1.0
+        return DEFAULT_STARTING_SCORE
     base = successful / total
     violation_penalty = violations * 0.02
     pii_penalty = pii_incidents * 0.05
-    return round(max(0.0, min(1.0, base - violation_penalty - pii_penalty)), 4)
+    raw_score = max(0.0, min(1.0, base - violation_penalty - pii_penalty))
+    return round(apply_trust_ceiling(raw_score, verified_interactions), 4)
 
 def log_history(client: httpx.Client, agent_id: str, event_type: str, detail: str):
     try:
@@ -136,7 +158,7 @@ def log_history(client: httpx.Client, agent_id: str, event_type: str, detail: st
 def root():
     return {
         "tool": "AgentID",
-        "version": "0.5.0",
+        "version": "0.6.0",
         "status": "running",
         "description": "Cryptographic identity and reputation for AI agents.",
         "suite": "Thread Suite"
@@ -188,11 +210,15 @@ def register_agent(body: AgentRegister):
             "successful_interactions": 0,
             "violation_count": 0,
             "pii_incidents": 0,
-            "reputation_score": 1.0
+            "verified_interactions": 0,
+            "reputation_score": DEFAULT_STARTING_SCORE
         })
 
         log_history(client, agent_id, "REGISTERED",
-                    f"Agent '{body.agent_name}' registered. Issuer: {ISSUER}")
+                    f"Agent '{body.agent_name}' registered. "
+                    f"Starting score: {DEFAULT_STARTING_SCORE}. "
+                    f"Trust ceiling active until {VERIFIED_INTERACTIONS_REQUIRED} "
+                    f"verified interactions accumulated.")
 
     return {
         "agent_id": agent_id,
@@ -201,10 +227,17 @@ def register_agent(body: AgentRegister):
         "issuer": ISSUER,
         "credential_hash": credential_hash,
         "active": True,
-        "reputation_score": 1.0,
-        "grade": "A",
+        "reputation_score": DEFAULT_STARTING_SCORE,
+        "grade": "C",
+        "verified_interactions": 0,
+        "trust_ceiling": TRUST_CEILING_BEFORE_TRACK_RECORD,
+        "track_record_required": VERIFIED_INTERACTIONS_REQUIRED,
         "created_at": created_at,
-        "message": "Credential issued. Store your credential_hash — it proves your identity."
+        "message": (
+            "Credential issued. New agents start at 0.5 (grade C — provisionally trusted). "
+            f"Full trust requires {VERIFIED_INTERACTIONS_REQUIRED} verified interactions. "
+            "Store your credential_hash — it proves your identity."
+        )
     }
 
 
@@ -233,7 +266,10 @@ def get_agent(agent_id: str):
         reputation = rep_r.json()[0] if rep_r.json() else None
 
         if reputation:
-            reputation["grade"] = get_reputation_grade(reputation["reputation_score"])
+            vi = reputation.get("verified_interactions", 0)
+            reputation["grade"] = get_reputation_grade(reputation["reputation_score"], vi)
+            reputation["trust_ceiling_active"] = vi < VERIFIED_INTERACTIONS_REQUIRED
+            reputation["track_record_required"] = VERIFIED_INTERACTIONS_REQUIRED
 
         return {"agent": agent, "reputation": reputation}
 
@@ -279,6 +315,7 @@ def verify_credential(agent_id: str, body: VerifyRequest):
 
         rep_r = client.get("/reputation", params={"agent_id": f"eq.{agent_id}"})
         rep = rep_r.json()[0] if rep_r.json() else None
+        vi = rep.get("verified_interactions", 0) if rep else 0
 
         log_history(client, agent_id,
                     "VERIFICATION_PASSED" if verified else "VERIFICATION_FAILED",
@@ -293,14 +330,16 @@ def verify_credential(agent_id: str, body: VerifyRequest):
         "issuer": agent["issuer"],
         "active": agent["active"],
         "reputation_score": rep["reputation_score"] if rep else None,
-        "grade": get_reputation_grade(rep["reputation_score"]) if rep else None,
+        "grade": get_reputation_grade(rep["reputation_score"], vi) if rep else None,
+        "verified_interactions": vi,
+        "trust_ceiling_active": vi < VERIFIED_INTERACTIONS_REQUIRED,
         "reason": "Credential verified successfully." if verified else "Credential hash mismatch — integrity check failed."
     }
 
 
 @app.post("/agents/{agent_id}/revoke")
 def revoke_credential(agent_id: str, body: RevokeRequest):
-    """Revoke an agent's credential. All future trust lookups will return trusted: false."""
+    """Revoke an agent's credential."""
     with db() as client:
         r = client.get("/agents", params={"agent_id": f"eq.{agent_id}"})
         if not r.json():
@@ -308,19 +347,11 @@ def revoke_credential(agent_id: str, body: RevokeRequest):
         agent = r.json()[0]
 
         if not agent["active"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Credential is already inactive."
-            )
+            raise HTTPException(status_code=400, detail="Credential is already inactive.")
 
-        client.patch(
-            f"/agents?agent_id=eq.{agent_id}",
-            json={"active": False}
-        )
-
+        client.patch(f"/agents?agent_id=eq.{agent_id}", json={"active": False})
         reason = body.reason or "No reason provided."
-        log_history(client, agent_id, "REVOKED",
-                    f"Credential revoked. Reason: {reason}")
+        log_history(client, agent_id, "REVOKED", f"Credential revoked. Reason: {reason}")
 
     return {
         "agent_id": agent_id,
@@ -335,7 +366,7 @@ def revoke_credential(agent_id: str, body: RevokeRequest):
 
 @app.post("/agents/{agent_id}/reactivate")
 def reactivate_credential(agent_id: str, body: ReactivateRequest):
-    """Reactivate a previously revoked credential. Requires the original public key."""
+    """Reactivate a previously revoked credential. Requires original public key."""
     with db() as client:
         r = client.get("/agents", params={"agent_id": f"eq.{agent_id}"})
         if not r.json():
@@ -343,10 +374,7 @@ def reactivate_credential(agent_id: str, body: ReactivateRequest):
         agent = r.json()[0]
 
         if agent["active"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Credential is already active."
-            )
+            raise HTTPException(status_code=400, detail="Credential is already active.")
 
         if agent["public_key"] != body.public_key:
             log_history(client, agent_id, "REACTIVATION_FAILED",
@@ -356,11 +384,7 @@ def reactivate_credential(agent_id: str, body: ReactivateRequest):
                 detail="Public key does not match. Reactivation denied."
             )
 
-        client.patch(
-            f"/agents?agent_id=eq.{agent_id}",
-            json={"active": True}
-        )
-
+        client.patch(f"/agents?agent_id=eq.{agent_id}", json={"active": True})
         reason = body.reason or "No reason provided."
         log_history(client, agent_id, "REACTIVATED",
                     f"Credential reactivated. Reason: {reason}")
@@ -394,12 +418,17 @@ def get_reputation(agent_id: str):
         rep = rep_r.json()[0]
 
         score = rep["reputation_score"]
+        vi = rep.get("verified_interactions", 0)
         return {
             "agent_id": agent_id,
             "agent_name": agent["agent_name"],
             "active": agent["active"],
             "reputation_score": score,
-            "grade": get_reputation_grade(score),
+            "grade": get_reputation_grade(score, vi),
+            "verified_interactions": vi,
+            "trust_ceiling_active": vi < VERIFIED_INTERACTIONS_REQUIRED,
+            "trust_ceiling": TRUST_CEILING_BEFORE_TRACK_RECORD,
+            "track_record_required": VERIFIED_INTERACTIONS_REQUIRED,
             "total_interactions": rep["total_interactions"],
             "successful_interactions": rep["successful_interactions"],
             "violation_count": rep["violation_count"],
@@ -428,13 +457,19 @@ def update_reputation(agent_id: str, body: ReputationUpdate):
         rep = rep_r.json()[0]
 
         score_before = rep["reputation_score"]
+        vi_before = rep.get("verified_interactions", 0)
+
         new_total = rep["total_interactions"] + 1
         new_successful = rep["successful_interactions"] + (1 if body.interaction_success else 0)
         new_violations = rep["violation_count"] + (1 if body.violation else 0)
         new_pii = rep["pii_incidents"] + (1 if body.pii_incident else 0)
 
+        # A verified interaction is one that succeeded with no violation and no PII incident
+        is_verified = body.interaction_success and not body.violation and not body.pii_incident
+        new_verified = vi_before + (1 if is_verified else 0)
+
         score_after = compute_reputation_score(
-            new_total, new_successful, new_violations, new_pii
+            new_total, new_successful, new_violations, new_pii, new_verified
         )
 
         client.patch(
@@ -444,6 +479,7 @@ def update_reputation(agent_id: str, body: ReputationUpdate):
                 "successful_interactions": new_successful,
                 "violation_count": new_violations,
                 "pii_incidents": new_pii,
+                "verified_interactions": new_verified,
                 "reputation_score": score_after,
                 "last_updated": datetime.now(timezone.utc).isoformat()
             }
@@ -461,22 +497,26 @@ def update_reputation(agent_id: str, body: ReputationUpdate):
 
         log_history(client, agent_id, "REPUTATION_UPDATED",
                     f"Score {score_before} → {score_after}. "
-                    f"Success: {body.interaction_success}, "
-                    f"Violation: {body.violation}, PII: {body.pii_incident}")
+                    f"Verified interactions: {vi_before} → {new_verified}. "
+                    f"Trust ceiling active: {new_verified < VERIFIED_INTERACTIONS_REQUIRED}.")
 
     return {
         "agent_id": agent_id,
         "score_before": score_before,
         "score_after": score_after,
-        "grade_before": get_reputation_grade(score_before),
-        "grade_after": get_reputation_grade(score_after),
+        "grade_before": get_reputation_grade(score_before, vi_before),
+        "grade_after": get_reputation_grade(score_after, new_verified),
+        "verified_interactions": new_verified,
+        "trust_ceiling_active": new_verified < VERIFIED_INTERACTIONS_REQUIRED,
+        "track_record_required": VERIFIED_INTERACTIONS_REQUIRED,
         "total_interactions": new_total,
         "successful_interactions": new_successful,
         "violation_count": new_violations,
         "pii_incidents": new_pii,
         "interaction_success": body.interaction_success,
         "violation": body.violation,
-        "pii_incident": body.pii_incident
+        "pii_incident": body.pii_incident,
+        "verified_this_interaction": is_verified
     }
 
 
@@ -497,11 +537,14 @@ def get_reputation_history(agent_id: str):
 
         rep_r = client.get("/reputation", params={"agent_id": f"eq.{agent_id}"})
         rep = rep_r.json()[0] if rep_r.json() else None
+        vi = rep.get("verified_interactions", 0) if rep else 0
 
         return {
             "agent_id": agent_id,
             "current_score": rep["reputation_score"] if rep else None,
-            "current_grade": get_reputation_grade(rep["reputation_score"]) if rep else None,
+            "current_grade": get_reputation_grade(rep["reputation_score"], vi) if rep else None,
+            "verified_interactions": vi,
+            "trust_ceiling_active": vi < VERIFIED_INTERACTIONS_REQUIRED,
             "total_events": len(history),
             "history": history
         }
@@ -591,9 +634,7 @@ def trust_lookup(body: TrustLookupRequest):
             return result
 
         recomputed = generate_credential_hash(
-            body.agent_id,
-            agent["public_key"],
-            agent["issuer"]
+            body.agent_id, agent["public_key"], agent["issuer"]
         )
         credential_valid = recomputed == agent["credential_hash"]
 
@@ -618,8 +659,9 @@ def trust_lookup(body: TrustLookupRequest):
 
         rep_r = client.get("/reputation", params={"agent_id": f"eq.{body.agent_id}"})
         rep = rep_r.json()[0] if rep_r.json() else None
-        score = rep["reputation_score"] if rep else 1.0
-        grade = get_reputation_grade(score)
+        score = rep["reputation_score"] if rep else DEFAULT_STARTING_SCORE
+        vi = rep.get("verified_interactions", 0) if rep else 0
+        grade = get_reputation_grade(score, vi)
         meets_threshold = score >= body.min_reputation
         trusted = credential_valid and meets_threshold
 
@@ -636,6 +678,8 @@ def trust_lookup(body: TrustLookupRequest):
             "credential_valid": credential_valid,
             "reputation_score": score,
             "grade": grade,
+            "verified_interactions": vi,
+            "trust_ceiling_active": vi < VERIFIED_INTERACTIONS_REQUIRED,
             "total_interactions": rep["total_interactions"] if rep else 0,
             "violation_count": rep["violation_count"] if rep else 0,
             "querying_agent": body.querying_agent,
@@ -652,7 +696,8 @@ def trust_lookup(body: TrustLookupRequest):
 
         log_history(client, body.agent_id, "TRUST_LOOKUP",
                     f"Queried by '{body.querying_agent}'. "
-                    f"Trusted: {trusted}. Score: {score}.")
+                    f"Trusted: {trusted}. Score: {score}. "
+                    f"Verified interactions: {vi}.")
 
     return result
 
@@ -726,16 +771,15 @@ def bridge_chainthread(body: ChainThreadBridgeRequest):
             return result
 
         recomputed = generate_credential_hash(
-            body.sender_id,
-            agent["public_key"],
-            agent["issuer"]
+            body.sender_id, agent["public_key"], agent["issuer"]
         )
         identity_verified = recomputed == agent["credential_hash"]
 
         rep_r = client.get("/reputation", params={"agent_id": f"eq.{body.sender_id}"})
         rep = rep_r.json()[0] if rep_r.json() else None
-        score = rep["reputation_score"] if rep else 1.0
-        grade = get_reputation_grade(score)
+        score = rep["reputation_score"] if rep else DEFAULT_STARTING_SCORE
+        vi = rep.get("verified_interactions", 0) if rep else 0
+        grade = get_reputation_grade(score, vi)
         meets_threshold = score >= body.min_reputation
         trusted = identity_verified and meets_threshold
 
@@ -758,6 +802,8 @@ def bridge_chainthread(body: ChainThreadBridgeRequest):
             "credential_valid": identity_verified,
             "reputation_score": score,
             "grade": grade,
+            "verified_interactions": vi,
+            "trust_ceiling_active": vi < VERIFIED_INTERACTIONS_REQUIRED,
             "total_interactions": rep["total_interactions"] if rep else 0,
             "violation_count": rep["violation_count"] if rep else 0,
             "min_reputation": body.min_reputation,
@@ -772,7 +818,8 @@ def bridge_chainthread(body: ChainThreadBridgeRequest):
         })
 
         log_history(client, body.sender_id, "CHAINTHREAD_BRIDGE",
-                    f"Chain {body.chain_id}: trusted={trusted}, score={score}.")
+                    f"Chain {body.chain_id}: trusted={trusted}, "
+                    f"score={score}, verified_interactions={vi}.")
 
     return result
 
@@ -807,9 +854,16 @@ def dashboard_stats():
         active = sum(1 for a in agents if a["active"])
         revoked = total - active
 
-        rep_r = client.get("/reputation", params={"select": "reputation_score"})
-        scores = [r["reputation_score"] for r in rep_r.json()]
+        rep_r = client.get("/reputation", params={
+            "select": "reputation_score,verified_interactions"
+        })
+        reps = rep_r.json()
+        scores = [r["reputation_score"] for r in reps]
         avg_score = round(sum(scores) / len(scores), 4) if scores else 0.0
+        agents_with_track_record = sum(
+            1 for r in reps
+            if r.get("verified_interactions", 0) >= VERIFIED_INTERACTIONS_REQUIRED
+        )
 
         lookups_r = client.get("/trust_lookups", params={"select": "id"})
         total_lookups = len(lookups_r.json())
@@ -822,6 +876,9 @@ def dashboard_stats():
             "active_agents": active,
             "revoked_agents": revoked,
             "avg_reputation_score": avg_score,
+            "agents_with_full_track_record": agents_with_track_record,
+            "verified_interactions_required": VERIFIED_INTERACTIONS_REQUIRED,
+            "trust_ceiling": TRUST_CEILING_BEFORE_TRACK_RECORD,
             "total_trust_lookups": total_lookups,
             "total_credential_events": total_events
         }
