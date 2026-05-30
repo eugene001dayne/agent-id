@@ -1,8 +1,21 @@
 {
   "name": "threadagentid",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "Cryptographic identity and reputation for AI agents. Part of the Thread Suite.",
   "main": "index.js",
+  "keywords": [
+    "ai",
+    "agents",
+    "identity",
+    "reputation",
+    "trust",
+    "cryptography",
+    "multi-agent",
+    "thread-suite",
+    "agent-identity",
+    "zero-trust",
+    "credential"
+  ],
   "dependencies": {
     "node-fetch": "^2.6.9"
   },
@@ -10,6 +23,6 @@
     "type": "git",
     "url": "https://github.com/eugene001dayne/agent-id"
   },
-  "author": "Eugene Dayne Mawuli",
+  "author": "Eugene Dayne Mawuli <bitelance.team@gmail.com>",
   "license": "Apache-2.0"
 }
